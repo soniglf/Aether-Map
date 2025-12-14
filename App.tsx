@@ -5,13 +5,13 @@ import { PerformanceView } from './src/ui/PerformanceView';
 import { MappingView } from './src/ui/MappingView';
 import { Copilot } from './src/ui/Copilot';
 import { audioAnalyzer } from './src/media/audioAnalysis';
-import { Grid, Monitor, Workflow, Activity } from 'lucide-react';
+import { Grid, Monitor, Workflow, Activity, Database, Film } from 'lucide-react';
 import { Telemetry } from './src/engine/telemetry';
 
 function App() {
   const containerRef = useRef<HTMLDivElement>(null);
   const { activeView, setActiveView } = useStore();
-  const [fps, setFps] = useState(60);
+  const [telemetry, setTelemetry] = useState({ fps: 60, tex: 0, vid: 0 });
 
   useEffect(() => {
     if (containerRef.current) {
@@ -21,7 +21,8 @@ function App() {
     
     // Telemetry Poller
     const interval = setInterval(() => {
-        setFps(Math.round(Telemetry.getInstance().fps));
+        const t = Telemetry.getInstance();
+        setTelemetry({ fps: Math.round(t.fps), tex: t.activeTextures, vid: t.activeVideos });
     }, 500);
     return () => clearInterval(interval);
   }, []);
@@ -48,9 +49,15 @@ function App() {
             </div>
         </div>
         <div className="flex items-center gap-4 text-xs font-mono text-zinc-500">
+             <div className="flex items-center gap-1" title="Active Textures">
+                <Database size={12} /> {telemetry.tex}
+            </div>
+             <div className="flex items-center gap-1" title="Active Videos">
+                <Film size={12} /> {telemetry.vid}
+            </div>
             <div className="flex items-center gap-1">
-                <Activity size={12} className={fps < 55 ? 'text-red-500' : 'text-green-500'} />
-                {fps} FPS
+                <Activity size={12} className={telemetry.fps < 55 ? 'text-red-500' : 'text-green-500'} />
+                {telemetry.fps} FPS
             </div>
             <div>GPU: PIXI 8 (WebGPU)</div>
         </div>
@@ -61,7 +68,7 @@ function App() {
         {/* Renderer Container (Background) */}
         <div 
             ref={containerRef} 
-            className="absolute inset-0 z-0 opacity-20 pointer-events-none" 
+            className="absolute inset-0 z-0 opacity-100 pointer-events-none" 
             style={{ display: activeView === 'mapping' ? 'none' : 'block' }} 
         />
 

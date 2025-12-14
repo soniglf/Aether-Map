@@ -19,6 +19,10 @@ interface AppState {
   importMedia: (file: File, layerId: string) => Promise<void>;
   updateSlice: (outputId: string, sliceId: string, points: {x:number, y:number}[]) => void;
   resetLayout: () => void;
+  
+  // Resource cleanup helper
+  orphanedResources: string[]; // List of IDs/URLs to clean up in renderer
+  clearOrphanedResources: () => void;
 }
 
 const generateMockLayer = (id: string, name: string): Layer => ({
@@ -31,7 +35,7 @@ const generateMockLayer = (id: string, name: string): Layer => ({
     name: `Slot ${i + 1}`,
     type: ClipType.GENERATOR, 
     active: false,
-    generatorId: 'empty', // Placeholder
+    generatorId: 'empty',
     params: []
   }))
 });
@@ -58,25 +62,22 @@ export const useStore = create<AppState>()(
     (set, get) => ({
       apiKey: process.env.GEMINI_API_KEY || null,
       ...DEFAULT_STATE,
+      orphanedResources: [],
 
       setApiKey: (key) => set({ apiKey: key }),
       setActiveView: (view) => set({ activeView: view }),
       resetLayout: () => set({ ...DEFAULT_STATE }),
+      clearOrphanedResources: () => set({ orphanedResources: [] }),
 
       triggerClip: (layerId, clipId) => set((state) => ({
         layers: state.layers.map(l => {
           if (l.id !== layerId) return l;
-          // Toggle logic: if clicking active, turn off. Else turn on.
           const isSame = l.activeClipId === clipId;
           const targetId = isSame ? null : clipId;
-          
           return {
             ...l,
             activeClipId: targetId,
-            clips: l.clips.map(c => ({
-                ...c,
-                active: c.id === targetId
-            }))
+            clips: l.clips.map(c => ({ ...c, active: c.id === targetId }))
           };
         })
       })),
@@ -94,18 +95,28 @@ export const useStore = create<AppState>()(
         }))
       })),
 
-      addClip: (layerId, clip) => set((state) => ({
-        layers: state.layers.map(l => {
+      addClip: (layerId, clip) => set((state) => {
+        // Find if we are replacing an existing clip with resources
+        let orphans: string[] = [...state.orphanedResources];
+        const newLayers = state.layers.map(l => {
             if (l.id !== layerId) return l;
+            
+            // Logic: fill first empty slot, OR replace current empty placeholder
+            // If dragging onto specific slot, UI should handle index. 
+            // For now, we find first empty.
             const emptyIdx = l.clips.findIndex(c => c.generatorId === 'empty');
             if (emptyIdx >= 0) {
                 const newClips = [...l.clips];
+                // Check if previous had resources (unlikely if 'empty', but safe to check)
+                if (newClips[emptyIdx].sourceUrl) orphans.push(newClips[emptyIdx].sourceUrl!);
+                
                 newClips[emptyIdx] = clip;
                 return { ...l, clips: newClips };
             }
             return { ...l, clips: [...l.clips, clip] };
-        })
-      })),
+        });
+        return { layers: newLayers, orphanedResources: orphans };
+      }),
 
       importMedia: async (file, layerId) => {
         const url = URL.createObjectURL(file);
@@ -122,7 +133,6 @@ export const useStore = create<AppState>()(
                 { id: uuidv4(), name: 'Scale', value: 1.0, min: 0.1, max: 2.0 }
             ]
         };
-
         get().addClip(layerId, newClip);
       },
 
@@ -140,17 +150,16 @@ export const useStore = create<AppState>()(
       name: 'aether-storage',
       storage: createJSONStorage(() => localStorage),
       partialize: (state) => ({
-         // Don't persist ephemeral blob URLs or API keys if we want security
          outputs: state.outputs,
          layers: state.layers.map(l => ({
              ...l,
-             activeClipId: null, // Reset active on reload
+             activeClipId: null, 
              clips: l.clips.map(c => ({
                  ...c,
                  active: false,
-                 // Note: Blob URLs will die on refresh. Real persistence needs IndexedDB.
-                 // For MVP we keep structure but user must re-import assets or use generators.
-                 sourceUrl: c.type === ClipType.GENERATOR ? undefined : '' 
+                 // Reset blob URLs on reload as they are invalid
+                 sourceUrl: c.type === ClipType.GENERATOR ? undefined : '',
+                 name: c.type === ClipType.GENERATOR ? c.name : (c.sourceUrl ? `${c.name} (Missing)` : c.name)
              }))
          }))
       })

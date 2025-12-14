@@ -10,8 +10,8 @@ const TOOL_BUILD_PATCH: FunctionDeclaration = {
     properties: {
       generatorType: {
         type: Type.STRING,
-        description: "The type of generator: 'smoke', 'particles', 'noise', 'feedback'.",
-        enum: ["smoke", "particles", "noise", "feedback"]
+        description: "The type of generator algorithm.",
+        enum: ["smoke", "voronoi", "scanline"]
       },
       params: {
         type: Type.OBJECT,
@@ -44,7 +44,7 @@ export class GeminiService {
         contents: prompt,
         config: {
           tools: [{ functionDeclarations: [TOOL_BUILD_PATCH] }],
-          systemInstruction: "You are an expert VJ and graphics programmer. Interpret abstract requests into concrete visual parameters.",
+          systemInstruction: "You are an expert VJ. Map abstract concepts to these generators: 'smoke' (ethereal, fluid), 'voronoi' (organic, cellular, biology), 'scanline' (tech, glitch, retro). Default to smoke if unsure.",
         }
       });
 
@@ -53,7 +53,6 @@ export class GeminiService {
       if (call && call.name === 'buildPatchFromPrompt') {
         const args = call.args as any;
         
-        // Construct a Clip object
         const newClip: Partial<Clip> = {
             id: uuidv4(),
             name: args.name || 'AI Patch',

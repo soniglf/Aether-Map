@@ -1,6 +1,6 @@
-import { Application, Container, Graphics, Shader, Mesh, Geometry, Texture, RenderTexture, Sprite, Assets } from 'pixi.js';
+import { Application, Container, Shader, Mesh, Geometry, Texture, RenderTexture, Sprite, Assets } from 'pixi.js';
 import { useStore } from '../model/store';
-import { BASIC_VERTEX, FEEDBACK_SMOKE_FRAG } from './shaders/generators';
+import { BASIC_VERTEX, FEEDBACK_SMOKE_FRAG, VORONOI_FLOW_FRAG, SCANLINE_GRID_FRAG } from './shaders/generators';
 import { audioAnalyzer } from '../media/audioAnalysis';
 import { Telemetry } from '../engine/telemetry';
 import { ClipType } from '../../types';
@@ -16,11 +16,12 @@ class AetherRenderer {
   private initialized = false;
   private initPromise: Promise<void> | null = null;
   
-  // Cache
+  // Cache & Resources
   private generatorMeshes: Map<string, Mesh> = new Map();
   private sliceMeshes: Map<string, Mesh> = new Map();
   private clipSprites: Map<string, Sprite> = new Map();
-  private textureCache: Map<string, Texture> = new Map();
+  private textureCache: Map<string, Texture> = new Map(); // Url -> Texture
+  private videoElements: Map<string, HTMLVideoElement> = new Map(); // Url -> VideoElement
 
   constructor() {
     this.compositionContainer = new Container();
@@ -44,13 +45,13 @@ class AetherRenderer {
                 resizeTo: window,
                 preference: 'webgpu',
                 background: '#000000',
-                antialias: true
+                antialias: true,
+                powerPreference: 'high-performance'
             });
 
             if (this.app.canvas) container.appendChild(this.app.canvas as unknown as Node);
 
-            // Create offscreen buffer for composition (Mixer)
-            // We use a fixed resolution for internal composition (e.g., 1080p) to ensure consistency
+            // Mixer Buffer (Internal Resolution)
             this.compositionTexture = RenderTexture.create({ width: 1920, height: 1080 });
             
             this.app.stage.addChild(this.outputContainer);
@@ -73,64 +74,44 @@ class AetherRenderer {
     return this.initPromise;
   }
 
-  // --- MESH GENERATION FOR SLICES ---
-  private updateSliceMesh(id: string, points: {x:number, y:number}[], texture: Texture) {
-     let mesh = this.sliceMeshes.get(id);
-     
-     // Points are 0-1 normalized. Map to screen coords.
-     const w = this.app!.screen.width;
-     const h = this.app!.screen.height;
-     
-     // Vertices: 4 points (TopLeft, TopRight, BottomRight, BottomLeft)
-     // Order for Triangle Strip or standard Index buffer matters.
-     // Let's use standard Quad index: 0-1-2, 0-2-3
-     const vertices = new Float32Array([
-         points[0].x * w, points[0].y * h, // TL
-         points[1].x * w, points[1].y * h, // TR
-         points[2].x * w, points[2].y * h, // BR
-         points[3].x * w, points[3].y * h  // BL
-     ]);
-
-     const uvs = new Float32Array([
-         0, 0, // TL
-         1, 0, // TR
-         1, 1, // BR
-         0, 1  // BL
-     ]);
-     
-     const indices = new Uint16Array([0, 1, 2, 0, 2, 3]);
-
-     if (!mesh) {
-         const geometry = new Geometry({
-             attributes: {
-                 aPosition: vertices,
-                 aUV: uvs
-             },
-             indexBuffer: indices
-         });
-         
-         // Simple shader that just maps texture
-         const shader = Shader.from({
-             gl: { vertex: BASIC_VERTEX, fragment: `
-                precision highp float;
-                in vec2 vTextureCoord;
-                out vec4 outColor;
-                uniform sampler2D uTexture;
-                void main() { outColor = texture(uTexture, vTextureCoord); }
-             `},
-         });
-         
-         mesh = new Mesh({ geometry, shader });
-         mesh.texture = texture;
-         this.outputContainer.addChild(mesh);
-         this.sliceMeshes.set(id, mesh);
-     } else {
-         // Update geometry
-         const buffer = mesh.geometry.getAttribute('aPosition').buffer;
-         buffer.data = vertices;
-         buffer.update();
-         mesh.texture = texture; // Ensure texture is current
-     }
+  // --- RESOURCE MANAGEMENT ---
+  private cleanUpOrphans() {
+      const state = useStore.getState();
+      if (state.orphanedResources.length > 0) {
+          state.orphanedResources.forEach(url => {
+              // Destroy texture
+              if (this.textureCache.has(url)) {
+                  const tex = this.textureCache.get(url);
+                  if (tex) tex.destroy(true); // True = destroy base texture
+                  this.textureCache.delete(url);
+              }
+              // Destroy video element
+              if (this.videoElements.has(url)) {
+                  const vid = this.videoElements.get(url);
+                  if (vid) {
+                      vid.pause();
+                      vid.src = "";
+                      vid.load();
+                  }
+                  this.videoElements.delete(url);
+              }
+              // Revoke Blob
+              if (url.startsWith('blob:')) {
+                  URL.revokeObjectURL(url);
+              }
+          });
+          state.clearOrphanedResources();
+          
+          // Rebuild sprite cache to remove stale IDs
+          // This is a naive sweep. Ideally we track ID -> URL map.
+          // For now, if a sprite's texture is destroyed, Pixi might warn. 
+          // We should iterate clipSprites and check if destroyed.
+          this.clipSprites.forEach((sprite, id) => {
+              if (sprite.destroyed || (sprite.texture && !sprite.texture.source)) {
+                  this.clipSprites.delete(id);
+              }
+          });
+      }
   }
 
   // --- CONTENT LOADING ---
@@ -141,16 +122,18 @@ class AetherRenderer {
               mesh = this.createGeneratorMesh(clip.generatorId || 'smoke');
               this.generatorMeshes.set(clip.id, mesh);
           }
-          // Update Generator Uniforms
+          // Update Uniforms
           if (mesh.shader) {
             const time = performance.now() / 1000;
             const audio = audioAnalyzer.getEnergy();
             mesh.shader.resources.uTime = mesh.shader.resources.uniforms.uTime = time;
-            // Map params
-            clip.params.forEach((p:any) => {
-                if(p.name === 'Speed') mesh!.shader.resources.uniforms.uSpeed = p.value;
-                if(p.name === 'Density') mesh!.shader.resources.uniforms.uDensity = p.value + (audio * 0.5);
-            });
+            
+            // Param Mapping
+            const speed = clip.params.find((p:any) => p.name === 'Speed')?.value ?? 1.0;
+            const density = clip.params.find((p:any) => p.name === 'Density')?.value ?? 0.5;
+            
+            mesh.shader.resources.uniforms.uSpeed = speed;
+            mesh.shader.resources.uniforms.uDensity = density + (audio * 0.5); // Reactivity
           }
           return mesh;
       } 
@@ -158,29 +141,37 @@ class AetherRenderer {
           if (!clip.sourceUrl) return null;
           
           let sprite = this.clipSprites.get(clip.id);
-          if (!sprite) {
-              // Try to reuse texture if exists
-              if (!this.textureCache.has(clip.sourceUrl)) {
-                 try {
-                     const texture = await Assets.load(clip.sourceUrl);
-                     if (clip.type === ClipType.VIDEO) {
-                         const source = texture.source.resource as HTMLVideoElement;
-                         if (source && source.loop !== undefined) {
-                             source.loop = true;
-                             source.muted = true;
-                             source.play();
-                         }
+          
+          // Load Texture if needed
+          if (!this.textureCache.has(clip.sourceUrl)) {
+             try {
+                 const texture = await Assets.load(clip.sourceUrl);
+                 
+                 if (clip.type === ClipType.VIDEO) {
+                     const source = texture.source.resource as HTMLVideoElement;
+                     if (source) {
+                         source.loop = true;
+                         source.muted = true;
+                         source.play().catch(e => console.warn("Autoplay blocked", e));
+                         this.videoElements.set(clip.sourceUrl, source);
                      }
-                     this.textureCache.set(clip.sourceUrl, texture);
-                 } catch (e) {
-                     console.warn("Failed to load asset", clip.sourceUrl);
-                     return null;
                  }
-              }
-              sprite = new Sprite(this.textureCache.get(clip.sourceUrl));
-              this.clipSprites.set(clip.id, sprite);
+                 this.textureCache.set(clip.sourceUrl, texture);
+             } catch (e) {
+                 console.warn("Failed to load asset", clip.sourceUrl);
+                 return null;
+             }
           }
-          return sprite;
+          
+          // Create Sprite if needed
+          if (!sprite) {
+              const tex = this.textureCache.get(clip.sourceUrl);
+              if (tex) {
+                  sprite = new Sprite(tex);
+                  this.clipSprites.set(clip.id, sprite);
+              }
+          }
+          return sprite || null;
       }
       return null;
   }
@@ -193,105 +184,144 @@ class AetherRenderer {
          },
          indexBuffer: [0, 1, 2, 0, 2, 3]
      });
+     
+     let frag = FEEDBACK_SMOKE_FRAG;
+     if (type === 'voronoi') frag = VORONOI_FLOW_FRAG;
+     if (type === 'scanline') frag = SCANLINE_GRID_FRAG;
+
      const shader = Shader.from({
-         gl: { vertex: BASIC_VERTEX, fragment: FEEDBACK_SMOKE_FRAG },
+         gl: { vertex: BASIC_VERTEX, fragment: frag },
      });
      return new Mesh({ geometry, shader });
+  }
+
+  // --- OUTPUT MAPPING ---
+  private updateSliceMesh(id: string, points: {x:number, y:number}[], texture: Texture) {
+     let mesh = this.sliceMeshes.get(id);
+     
+     const w = this.app!.screen.width;
+     const h = this.app!.screen.height;
+     
+     // Corner Pin: Map texture quad to arbitrary 4 screen points
+     const vertices = new Float32Array([
+         points[0].x * w, points[0].y * h, // TL
+         points[1].x * w, points[1].y * h, // TR
+         points[2].x * w, points[2].y * h, // BR
+         points[3].x * w, points[3].y * h  // BL
+     ]);
+     
+     // Standard UVs for the full Composition Texture
+     const uvs = new Float32Array([0, 0, 1, 0, 1, 1, 0, 1]);
+     const indices = new Uint16Array([0, 1, 2, 0, 2, 3]); // Two triangles
+
+     if (!mesh) {
+         const geometry = new Geometry({
+             attributes: { aPosition: vertices, aUV: uvs },
+             indexBuffer: indices
+         });
+         // Basic texture shader
+         const shader = Shader.from({
+             gl: { vertex: BASIC_VERTEX, fragment: `
+                precision highp float;
+                in vec2 vTextureCoord;
+                out vec4 outColor;
+                uniform sampler2D uTexture;
+                void main() { outColor = texture(uTexture, vTextureCoord); }
+             `},
+         });
+         mesh = new Mesh({ geometry, shader });
+         mesh.texture = texture;
+         this.outputContainer.addChild(mesh);
+         this.sliceMeshes.set(id, mesh);
+     } else {
+         const buffer = mesh.geometry.getAttribute('aPosition').buffer;
+         buffer.data = vertices;
+         buffer.update();
+         mesh.texture = texture; 
+     }
   }
 
   render(deltaTime: number) {
     if (!this.initialized || !this.app || !this.compositionTexture) return;
     
-    Telemetry.getInstance().tick();
+    // Telemetry
+    const telem = Telemetry.getInstance();
+    telem.tick();
+    telem.activeTextures = this.textureCache.size;
+    telem.activeVideos = this.videoElements.size;
+    
+    this.cleanUpOrphans();
     const state = useStore.getState();
 
-    // 1. Render Layers to Composition Buffer
-    // We manually clear the container and re-add active clips.
-    // In a simpler engine, we might keep them added and toggle visibility,
-    // but for dynamic clip switching, rebuilding the simple display list is fine.
+    // 1. MIXER: Render Layers to Composition Buffer
     this.compositionContainer.removeChildren();
     
-    // Reverse layer order for painter's algorithm (Bottom layer first)
-    // Actually store order: L3 (Top), L2, L1 (Bottom). So we iterate backwards?
-    // Let's assume store order is Bottom -> Top. L1 is index 0.
+    // Render layers Bottom -> Top
     for (const layer of state.layers) {
         if (layer.opacity === 0) continue;
         const activeClip = layer.clips.find(c => c.id === layer.activeClipId);
         
         if (activeClip) {
-            // Because getClipContent might be async for loading, strictly we should handle that.
-            // But for this loop we assume cache hit.
-            // We'll use a sync check for cache availability.
             let content: Container | null = null;
             
             if (activeClip.type === ClipType.GENERATOR) {
+                // Sync create/get for generators
                 content = this.generatorMeshes.get(activeClip.id) || null;
-                // If not created yet, create synchronously (generators are fast)
                 if (!content) { 
                     content = this.createGeneratorMesh(activeClip.generatorId || 'smoke'); 
                     this.generatorMeshes.set(activeClip.id, content as Mesh);
                 }
-                // Update uniforms logic repeats here or extracted. 
-                // For brevity, assuming generator meshes update via their reference or in previous step.
-                 const mesh = content as Mesh;
-                 const time = performance.now() / 1000;
-                 const audio = audioAnalyzer.getEnergy();
-                 if(mesh.shader) {
+                // Uniforms update
+                const mesh = content as Mesh;
+                if(mesh.shader) {
+                    const time = performance.now() / 1000;
+                    const audio = audioAnalyzer.getEnergy();
                     mesh.shader.resources.uTime = mesh.shader.resources.uniforms.uTime = time;
-                    activeClip.params.forEach(p => {
-                         if(p.name === 'Speed') mesh.shader.resources.uniforms.uSpeed = p.value;
-                         if(p.name === 'Density') mesh.shader.resources.uniforms.uDensity = p.value + (audio * 0.5);
-                    });
-                 }
-
+                    mesh.shader.resources.uniforms.uSpeed = activeClip.params.find(p => p.name==='Speed')?.value ?? 1;
+                    mesh.shader.resources.uniforms.uDensity = (activeClip.params.find(p => p.name==='Density')?.value ?? 0.5) + (audio * 0.2);
+                }
             } else {
+                // Async get for media
                 content = this.clipSprites.get(activeClip.id) || null;
-                // Async load happens elsewhere? Trigger it if missing.
                 if (!content && activeClip.sourceUrl) {
                     this.getClipContent(activeClip); // Trigger load
                 }
             }
 
             if (content) {
-                content.alpha = layer.opacity;
-                content.width = 1920; // Fit comp
+                content.alpha = layer.opacity * state.globalOpacity;
+                content.width = 1920; 
                 content.height = 1080;
                 this.compositionContainer.addChild(content);
             }
         }
     }
 
-    // Render Composition to Texture
     this.app.renderer.render({
         container: this.compositionContainer,
         target: this.compositionTexture,
         clear: true
     });
 
-    // 2. Render Output Slices (Warping)
-    // Ensure all output slices exist as meshes and are updated
+    // 2. OUTPUT: Render Slices
     state.outputs[0].slices.forEach(slice => {
         if (!slice.active) return;
         this.updateSliceMesh(slice.id, slice.points, this.compositionTexture!);
     });
-
-    // If we are in "Mapping" view, we might want to see lines?
-    // The MappingView component draws DOM handles overlay, so we just render the warped content behind it.
+    
+    // The Pixi View is automatically updated by the ticker rendering the stage (outputContainer)
   }
 
   destroy() {
       this.initialized = false;
       this.initPromise = null;
       if (this.app) {
-          try {
-              this.app.destroy({ removeView: true }, { children: true });
-          } catch {}
+          try { this.app.destroy({ removeView: true }, { children: true }); } catch {}
           this.app = null;
       }
   }
 }
 
-// HMR Safe Singleton
 const GLOBAL_KEY = '__AETHER_RENDERER__';
 const oldInstance = (window as any)[GLOBAL_KEY];
 if (oldInstance) oldInstance.destroy();

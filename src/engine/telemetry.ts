@@ -2,7 +2,9 @@ export class Telemetry {
   private static instance: Telemetry;
   fps: number = 60;
   frameTime: number = 0;
-  drawCalls: number = 0;
+  drawCalls: number = 0; // Estimated
+  activeTextures: number = 0;
+  activeVideos: number = 0;
   private lastTime: number = 0;
   private frameCount: number = 0;
 
