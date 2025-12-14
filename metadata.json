@@ -1,0 +1,8 @@
+{
+  "name": "AETHER MAP",
+  "description": "Next-gen web media server with AI copilot, real-time generative graphics, and advanced mapping capabilities.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
